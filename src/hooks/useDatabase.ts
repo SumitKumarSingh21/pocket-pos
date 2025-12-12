@@ -1,3 +1,4 @@
+// src/hooks/useDatabase.ts
 import { useState, useEffect, useCallback } from 'react';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { 
@@ -270,7 +271,7 @@ export const useSettings = () => {
 };
 
 // ============================================
-// AUTH HOOK
+// AUTH HOOK (improved - preview-friendly)
 // ============================================
 
 export const useAuth = () => {
@@ -278,21 +279,103 @@ export const useAuth = () => {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    getCurrentUser().then(u => {
-      setUser(u);
-      setLoading(false);
-    });
+    let cancelled = false;
+
+    async function init() {
+      try {
+        // 1) Check for a demo user in localStorage (quick manual preview)
+        const demoJson = localStorage.getItem('demo_user');
+        if (demoJson) {
+          try {
+            const parsed = JSON.parse(demoJson) as AppUser;
+            if (!cancelled) {
+              // Persist into db.users so other parts of app using db see it (optional)
+              try {
+                await db.users.clear();
+                await db.users.add(parsed);
+              } catch (err) {
+                // ignore persistence errors
+                console.warn('[useAuth] failed to persist demo_user into db:', err);
+              }
+              console.info('[useAuth] using demo_user from localStorage');
+              setUser(parsed);
+              setLoading(false);
+              return;
+            }
+          } catch (err) {
+            console.warn('[useAuth] demo_user parse failed', err);
+          }
+        }
+
+        // 2) Try to get the real current user from the local DB
+        const u = await getCurrentUser();
+        if (u) {
+          if (!cancelled) {
+            console.info('[useAuth] found user in DB:', u);
+            setUser(u);
+            setLoading(false);
+          }
+          return;
+        }
+
+        // 3) If not found, check preview mode env var and create a lightweight demo user
+        //    Set VITE_ENABLE_PREVIEW=true in your preview host (or .env.local for local testing)
+        if (import.meta.env.VITE_ENABLE_PREVIEW === 'true') {
+          const demoUser: AppUser = {
+            id: 'demo_user',
+            name: 'Preview User',
+            email: 'preview@example.com',
+            role: 'owner',
+            isLoggedIn: true,
+            loginAt: Date.now()
+          } as AppUser;
+
+          try {
+            // persist demo user so other hooks using db.users can pick it up
+            await db.users.clear();
+            await db.users.add(demoUser);
+            if (!cancelled) {
+              console.info('[useAuth] created demo user for preview');
+              setUser(demoUser);
+              setLoading(false);
+            }
+            return;
+          } catch (err) {
+            console.warn('[useAuth] failed to persist demo user, continuing without it', err);
+          }
+        }
+
+        // 4) Default: no user
+        if (!cancelled) {
+          console.info('[useAuth] no user found (not authenticated)');
+          setUser(null);
+          setLoading(false);
+        }
+      } catch (err) {
+        console.error('[useAuth] initialization error', err);
+        if (!cancelled) {
+          setUser(null);
+          setLoading(false);
+        }
+      }
+    }
+
+    init();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const login = useCallback(async (userData: Omit<AppUser, 'isLoggedIn' | 'loginAt'>) => {
-    // Clear any existing login
+    // Clear any existing login and add the logged-in user to db
     await db.users.clear();
-    
+
     const user: AppUser = {
       ...userData,
       isLoggedIn: true,
       loginAt: Date.now()
-    };
+    } as AppUser;
+
     await db.users.add(user);
     setUser(user);
     return user;
@@ -300,6 +383,8 @@ export const useAuth = () => {
 
   const logout = useCallback(async () => {
     await db.users.clear();
+    // also remove demo_user localStorage if present (optional)
+    if (localStorage.getItem('demo_user')) localStorage.removeItem('demo_user');
     setUser(null);
   }, []);
 
