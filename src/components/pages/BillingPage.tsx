@@ -2,7 +2,7 @@ import { useState, useMemo } from 'react';
 import { 
   Plus, Minus, Trash2, Search, User, ShoppingCart, 
   Percent, CreditCard, Banknote, Smartphone, Receipt,
-  Share2, Download, Mic, MicOff, X
+  Share2, Download, Mic, MicOff, X, Loader2
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -13,9 +13,9 @@ import { Badge } from '@/components/ui/badge';
 import { useToast } from '@/hooks/use-toast';
 import { useItems, useCustomers, useBills, useSettings } from '@/hooks/useDatabase';
 import { useSpeechRecognition } from '@/hooks/useSpeechRecognition';
-import { parseBillFromText } from '@/lib/mockAI';
 import { generateInvoicePDF, shareInvoiceViaWhatsApp, downloadPDF } from '@/lib/pdfGenerator';
 import { getNextInvoiceNumber, deductStock, type Bill, type BillItem, type Item, type ItemVariant } from '@/lib/db';
+import { supabase } from '@/integrations/supabase/client';
 
 interface CartItem {
   itemId: string;
@@ -44,6 +44,7 @@ export default function BillingPage() {
   const [selectedVariant, setSelectedVariant] = useState<ItemVariant | null>(null);
   const [itemQty, setItemQty] = useState(1);
   const [processing, setProcessing] = useState(false);
+  const [aiProcessing, setAiProcessing] = useState(false);
   
   const { isListening, transcript, isSupported, startListening, stopListening, resetTranscript } = useSpeechRecognition();
 
@@ -70,22 +71,64 @@ export default function BillingPage() {
 
   const selectedCustomer = customers.find(c => c.id === selectedCustomerId);
 
-  // Handle voice billing
-  const handleVoiceBilling = () => {
+  // Handle voice billing with real AI
+  const handleVoiceBilling = async () => {
     if (isListening) {
       stopListening();
       if (transcript) {
-        const parsed = parseBillFromText(transcript, items);
-        if (parsed.length > 0) {
-          const bestMatch = parsed[0];
-          if (bestMatch.matchedItem) {
-            handleAddToCart(bestMatch.matchedItem, bestMatch.quantity, bestMatch.size, bestMatch.color);
-            toast({ title: `Added ${bestMatch.quantity}x ${bestMatch.name}` });
+        setAiProcessing(true);
+        try {
+          // Call AI edge function for intelligent parsing
+          const { data, error } = await supabase.functions.invoke('ai-voice-billing', {
+            body: { 
+              text: transcript, 
+              inventory: items.map(item => ({
+                id: item.id,
+                name: item.name,
+                category: item.category,
+                basePrice: item.basePrice,
+                variants: item.variants
+              }))
+            }
+          });
+
+          if (error) throw error;
+
+          if (data?.success && data.items?.length > 0) {
+            let addedCount = 0;
+            for (const parsedItem of data.items) {
+              const matchedItem = items.find(i => i.id === parsedItem.itemId);
+              if (matchedItem) {
+                handleAddToCart(matchedItem, parsedItem.quantity || 1, parsedItem.size, parsedItem.color);
+                addedCount++;
+              }
+            }
+            
+            if (addedCount > 0) {
+              toast({ title: `Added ${addedCount} item(s) via AI voice billing` });
+            } else {
+              toast({ title: 'No matching items found', variant: 'destructive' });
+            }
+
+            // Set customer if AI detected one
+            if (data.customerName) {
+              const matchedCustomer = customers.find(c => 
+                c.name.toLowerCase().includes(data.customerName.toLowerCase())
+              );
+              if (matchedCustomer) {
+                setSelectedCustomerId(matchedCustomer.id);
+              }
+            }
+          } else {
+            toast({ title: 'Could not parse voice input', variant: 'destructive' });
           }
-        } else {
-          toast({ title: 'Could not find matching item', variant: 'destructive' });
+        } catch (err) {
+          console.error('AI voice billing error:', err);
+          toast({ title: 'AI processing failed', description: 'Please try again', variant: 'destructive' });
+        } finally {
+          setAiProcessing(false);
+          resetTranscript();
         }
-        resetTranscript();
       }
     } else {
       startListening();
@@ -232,17 +275,26 @@ export default function BillingPage() {
             variant={isListening ? 'destructive' : 'outline'}
             size="icon"
             onClick={handleVoiceBilling}
+            disabled={aiProcessing}
           >
-            {isListening ? <MicOff className="h-5 w-5" /> : <Mic className="h-5 w-5" />}
+            {aiProcessing ? (
+              <Loader2 className="h-5 w-5 animate-spin" />
+            ) : isListening ? (
+              <MicOff className="h-5 w-5" />
+            ) : (
+              <Mic className="h-5 w-5" />
+            )}
           </Button>
         )}
       </div>
 
-      {isListening && (
+      {(isListening || aiProcessing) && (
         <Card className="bg-primary/5 border-primary/30">
           <CardContent className="pt-4">
-            <p className="text-sm text-muted-foreground">Listening...</p>
-            <p className="font-medium">{transcript || 'Say item name and quantity'}</p>
+            <p className="text-sm text-muted-foreground">
+              {aiProcessing ? 'AI is processing...' : 'Listening...'}
+            </p>
+            <p className="font-medium">{transcript || 'Say item name and quantity (e.g., "2 blue shirts large size")'}</p>
           </CardContent>
         </Card>
       )}
