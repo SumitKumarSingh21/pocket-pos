@@ -324,11 +324,11 @@ export const useAuth = () => {
           const demoUser: AppUser = {
             id: 'demo_user',
             name: 'Preview User',
-            email: 'preview@example.com',
+            phone: '+919999999999',
             role: 'owner',
             isLoggedIn: true,
             loginAt: Date.now()
-          } as AppUser;
+          };
 
           try {
             // persist demo user so other hooks using db.users can pick it up

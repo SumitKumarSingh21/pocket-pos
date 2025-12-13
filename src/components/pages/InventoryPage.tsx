@@ -1,5 +1,5 @@
-import { useState } from 'react';
-import { Plus, Search, Package, AlertTriangle, Edit2, Trash2, TrendingUp, TrendingDown } from 'lucide-react';
+import { useState, useRef } from 'react';
+import { Plus, Search, Package, AlertTriangle, Edit2, Trash2, TrendingUp, TrendingDown, Upload, Camera, Loader2, FileText, Check } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -8,7 +8,8 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Badge } from '@/components/ui/badge';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { useToast } from '@/hooks/use-toast';
-import { useItems } from '@/hooks/useDatabase';
+import { useItems, useVendors, usePurchases } from '@/hooks/useDatabase';
+import { supabase } from '@/integrations/supabase/client';
 import type { Item, ItemVariant } from '@/lib/db';
 
 const categories = ['Clothing', 'Footwear', 'Accessories', 'Electronics', 'Grocery', 'Other'];
@@ -16,13 +17,50 @@ const sizes = ['XS', 'S', 'M', 'L', 'XL', 'XXL', 'Free Size'];
 const colors = ['Black', 'White', 'Blue', 'Red', 'Green', 'Yellow', 'Pink', 'Brown', 'Grey', 'Navy', 'Maroon'];
 const gstRates = [0, 5, 12, 18, 28];
 
+interface ExtractedBillItem {
+  name: string;
+  quantity: number;
+  unit: string;
+  rate: number;
+  size?: string;
+  color?: string;
+  total: number;
+  gstRate: number;
+  selected?: boolean;
+}
+
+interface ExtractedBillData {
+  vendor: {
+    name: string;
+    phone?: string;
+    address?: string;
+    gstin?: string;
+  };
+  bill: {
+    invoiceNumber: string;
+    date: string;
+    totalAmount: number;
+    gstAmount: number;
+  };
+  items: ExtractedBillItem[];
+  confidence: number;
+  notes?: string;
+}
+
 export default function InventoryPage() {
   const { items, lowStockItems, addItem, updateItem, deleteItem } = useItems();
+  const { vendors, addVendor } = useVendors();
+  const { addPurchase } = usePurchases();
   const { toast } = useToast();
 
   const [searchQuery, setSearchQuery] = useState('');
   const [showAddDialog, setShowAddDialog] = useState(false);
   const [editingItem, setEditingItem] = useState<Item | null>(null);
+  const [showBillOCRDialog, setShowBillOCRDialog] = useState(false);
+  const [ocrProcessing, setOcrProcessing] = useState(false);
+  const [extractedData, setExtractedData] = useState<ExtractedBillData | null>(null);
+  const [importingItems, setImportingItems] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   
   // Form state
   const [formData, setFormData] = useState({
@@ -132,15 +170,174 @@ export default function InventoryPage() {
     toast({ title: 'Item deleted' });
   };
 
+  // Handle bill image upload for OCR
+  const handleBillUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    setOcrProcessing(true);
+    setShowBillOCRDialog(true);
+    setExtractedData(null);
+
+    try {
+      // Convert to base64
+      const reader = new FileReader();
+      reader.onloadend = async () => {
+        const base64 = (reader.result as string).split(',')[1];
+        
+        // Call AI OCR edge function
+        const { data, error } = await supabase.functions.invoke('ai-bill-ocr', {
+          body: { imageBase64: base64 }
+        });
+
+        if (error) throw error;
+
+        if (data?.success) {
+          // Mark all items as selected by default
+          const itemsWithSelection = data.items.map((item: ExtractedBillItem) => ({
+            ...item,
+            selected: true
+          }));
+          setExtractedData({ ...data, items: itemsWithSelection });
+          toast({ title: `Extracted ${data.items.length} items from bill` });
+        } else {
+          throw new Error(data?.error || 'Failed to extract data');
+        }
+      };
+      reader.readAsDataURL(file);
+    } catch (err) {
+      console.error('Bill OCR error:', err);
+      toast({ title: 'Failed to read bill', description: 'Please try with a clearer image', variant: 'destructive' });
+      setShowBillOCRDialog(false);
+    } finally {
+      setOcrProcessing(false);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  };
+
+  // Toggle item selection in extracted data
+  const toggleItemSelection = (index: number) => {
+    if (!extractedData) return;
+    const newItems = [...extractedData.items];
+    newItems[index].selected = !newItems[index].selected;
+    setExtractedData({ ...extractedData, items: newItems });
+  };
+
+  // Import selected items to inventory
+  const handleImportItems = async () => {
+    if (!extractedData) return;
+    
+    setImportingItems(true);
+    const selectedItems = extractedData.items.filter(item => item.selected);
+    
+    try {
+      // Check if vendor exists, if not create one
+      let vendorId = vendors.find(v => v.name.toLowerCase() === extractedData.vendor.name.toLowerCase())?.id;
+      
+      if (!vendorId && extractedData.vendor.name) {
+        vendorId = await addVendor({
+          name: extractedData.vendor.name,
+          phone: extractedData.vendor.phone || '',
+          email: undefined,
+          address: extractedData.vendor.address,
+          gstNumber: extractedData.vendor.gstin
+        });
+      }
+
+      // Add items to inventory
+      let addedCount = 0;
+      for (const billItem of selectedItems) {
+        // Check if item already exists
+        const existingItem = items.find(i => 
+          i.name.toLowerCase() === billItem.name.toLowerCase()
+        );
+
+        if (existingItem) {
+          // Update stock for existing item
+          const newVariants = [...existingItem.variants];
+          if (newVariants.length > 0) {
+            newVariants[0].stock += billItem.quantity;
+          }
+          await updateItem(existingItem.id, {
+            variants: newVariants,
+            totalStock: existingItem.totalStock + billItem.quantity
+          });
+        } else {
+          // Add new item
+          await addItem({
+            name: billItem.name,
+            category: 'Other',
+            basePrice: billItem.rate,
+            gstRate: billItem.gstRate || 0,
+            unit: billItem.unit || 'pcs',
+            variants: [{
+              size: billItem.size || 'Free Size',
+              color: billItem.color || 'Default',
+              sku: '',
+              stock: billItem.quantity
+            }],
+            totalStock: billItem.quantity,
+            lowStockThreshold: 5
+          });
+        }
+        addedCount++;
+      }
+
+      // Create purchase record
+      if (vendorId) {
+        await addPurchase({
+          vendorId,
+          vendorName: extractedData.vendor.name,
+          invoiceNumber: extractedData.bill.invoiceNumber || `PO-${Date.now()}`,
+          items: selectedItems.map(item => ({
+            itemId: `new_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+            name: item.name,
+            quantity: item.quantity,
+            costPrice: item.rate,
+            total: item.total
+          })),
+          totalAmount: extractedData.bill.totalAmount,
+          paidAmount: 0,
+          status: 'pending'
+        });
+      }
+
+      toast({ title: `Imported ${addedCount} items to inventory!` });
+      setShowBillOCRDialog(false);
+      setExtractedData(null);
+    } catch (err) {
+      console.error('Import error:', err);
+      toast({ title: 'Failed to import items', variant: 'destructive' });
+    } finally {
+      setImportingItems(false);
+    }
+  };
+
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-2">
         <h2 className="text-2xl font-bold">Inventory</h2>
-        <Dialog open={showAddDialog} onOpenChange={(open) => { setShowAddDialog(open); if (!open) resetForm(); }}>
-          <DialogTrigger asChild>
-            <Button>
-              <Plus className="h-4 w-4 mr-2" />
-              Add Item
+        <div className="flex gap-2">
+          {/* Hidden file input */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            className="hidden"
+            onChange={handleBillUpload}
+          />
+          
+          {/* Smart Bill Upload Button */}
+          <Button variant="outline" onClick={() => fileInputRef.current?.click()}>
+            <Upload className="h-4 w-4 mr-2" />
+            <span className="hidden sm:inline">Upload Bill</span>
+          </Button>
+          
+          <Dialog open={showAddDialog} onOpenChange={(open) => { setShowAddDialog(open); if (!open) resetForm(); }}>
+            <DialogTrigger asChild>
+              <Button>
+                <Plus className="h-4 w-4 mr-2" />
+                Add Item
             </Button>
           </DialogTrigger>
           <DialogContent className="max-w-md max-h-[90vh] overflow-y-auto">
@@ -255,7 +452,56 @@ export default function InventoryPage() {
             </div>
           </DialogContent>
         </Dialog>
+        </div>
       </div>
+
+      {/* Bill OCR Dialog */}
+      <Dialog open={showBillOCRDialog} onOpenChange={setShowBillOCRDialog}>
+        <DialogContent className="max-w-lg max-h-[90vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>
+              {ocrProcessing ? 'Reading Bill...' : extractedData ? 'Extracted Items' : 'Upload Bill'}
+            </DialogTitle>
+          </DialogHeader>
+          {ocrProcessing ? (
+            <div className="flex flex-col items-center py-8">
+              <Loader2 className="h-8 w-8 animate-spin text-primary" />
+              <p className="mt-2 text-sm text-muted-foreground">AI is reading your bill...</p>
+            </div>
+          ) : extractedData ? (
+            <div className="space-y-4">
+              <div className="bg-muted p-3 rounded-lg text-sm">
+                <p><strong>Vendor:</strong> {extractedData.vendor.name || 'Unknown'}</p>
+                <p><strong>Invoice:</strong> {extractedData.bill.invoiceNumber || 'N/A'}</p>
+                <p><strong>Total:</strong> ₹{extractedData.bill.totalAmount || 0}</p>
+                <p><strong>Confidence:</strong> {Math.round((extractedData.confidence || 0) * 100)}%</p>
+              </div>
+              <div className="space-y-2 max-h-60 overflow-y-auto">
+                {extractedData.items.map((item, idx) => (
+                  <div key={idx} className="flex items-center gap-2 p-2 border rounded">
+                    <input
+                      type="checkbox"
+                      checked={item.selected}
+                      onChange={() => toggleItemSelection(idx)}
+                      className="h-4 w-4"
+                    />
+                    <div className="flex-1 min-w-0">
+                      <p className="font-medium truncate">{item.name}</p>
+                      <p className="text-xs text-muted-foreground">
+                        {item.quantity} {item.unit} × ₹{item.rate} = ₹{item.total}
+                      </p>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <Button className="w-full" onClick={handleImportItems} disabled={importingItems}>
+                {importingItems ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : <Check className="h-4 w-4 mr-2" />}
+                Import {extractedData.items.filter(i => i.selected).length} Items
+              </Button>
+            </div>
+          ) : null}
+        </DialogContent>
+      </Dialog>
 
       {/* Search */}
       <div className="relative">
